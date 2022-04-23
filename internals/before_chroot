@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+
+require_relative 'yabe'
+require_relative 'config'
+require_relative 'vars'
+
+executor = YABE::Executor.new(default_options: Vars::OPTIONS)
+
+# Sets the computer clock.
+executor.execute ['timedatectl', 'set-ntp', 'true']
+executor.execute ['hwclock', '--systohc', '--utc']
+
+# Does partitioning if auto is true.
+if CONFIG[:partitioning][:auto]
+  # Wipes the disk for installation.
+  executor.execute ['wipefs', '-af', CONFIG[:partitioning][:disk]]
+  
+  # Creates a 512MiB EFI partition unless the bootloader is not selected.
+  unless CONFIG[:bootloader] == false
+    executor.execute [
+      'sgdisk', '-n', '0:0:+512MiB', '-t', '0:ef00',
+      CONFIG[:partitioning][:disk],
+    ]
+  end
+  
+  unless CONFIG[:partitioning][:swap] == false
+    # Creates a partition with space for swap left at the end.
+    executor.execute [
+      'sgdisk', '-n', "0:0:-#{CONFIG[:partitioning][:swap]}",
+      CONFIG[:partitioning][:disk],
+    ]
+    # Creates a swap partition with all left space.
+    executor.execute [
+      'sgdisk', '-n', '0:0:0', '-t', '0:8200', CONFIG[:partitioning][:disk],
+    ]
+  else
+    # Creates a partition with all left space.
+    executor.execute ['sgdisk', '-n', '0:0:0', CONFIG[:partitioning][:disk]]
+  end
+
+  # Makes the boot partition vfat32.
+  executor.execute ['mkfs', '-t', 'vfat', '-F', '32', Vars::PARTITIONS[:boot]]
+
+  # Sets the chosen file system for the root partition. 
+  executor.execute [
+    'ruby', '-e',
+    <<~EOD
+      system(
+        'mkfs -t "#{CONFIG[:partitioning][:filesystem]}"'\\
+          ' "#{Vars::PARTITIONS[:root]}"'
+      )
+      unless $?.success?
+        system(
+          'mkfs -t "#{CONFIG[:partitioning][:filesystem]}" -f'\\
+            ' "#{Vars::PARTITIONS[:root]}"'
+        )
+      end
+    EOD
+  ]
+
+  # Enables swap unless it is declared false.
+  unless CONFIG[:partitioning][:swap] == false
+    executor.execute ['mkswap', Vars::PARTITIONS[:swap]]
+    executor.execute ['swapon', Vars::PARTITIONS[:swap]]
+  end
+end
+
+# Mounts the partitions.
+executor.execute ['mount', Vars::PARTITIONS[:root], '/mnt']
+executor.execute ['mkdir', '/mnt/boot']
+executor.execute ['mount', Vars::PARTITIONS[:boot], '/mnt/boot']
+
+# Installs the base package, firmware and the kernel.
+executor.execute [
+  'pacstrap', '/mnt', 'base', CONFIG[:kernel], 'linux-firmware', 'ruby',
+]
+
+# Generates fstab.
+executor.execute [
+  'ruby', '-e', "File.write('/mnt/etc/fstab', `genfstab -U /mnt`, mode: 'a')",
+]

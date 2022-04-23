@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+
+require_relative 'yabe'
+require_relative 'config'
+require_relative 'vars'
+
+executor = YABE::Executor.new(default_options: Vars::OPTIONS)
+
+# Updates all packages.
+executor.execute ['pacman', '-Syu', '--noconfirm']
+
+# Sets the timezone.
+executor.execute ['timedatectl', 'set-timezone', CONFIG[:timezone]]
+
+# Sets the locale.
+executor.execute [
+  'ruby', '-e',
+  <<~EOD
+    found = false
+    File.readlines('/etc/locale.gen').each do |line|
+      if line =~ /.*#{Regexp.quote CONFIG[:locale]}.*(U|u)(T|t)(F|f).*8.*/
+        found = true
+        File.write('/etc/locale.gen', line[1...], mode: 'a')
+        break
+      end
+    end
+    raise 'ERROR: locale not found' unless found
+  EOD
+]
+executor.execute ['locale-gen']
+executor.execute [
+  'ruby', '-e',
+  %(File.write('/etc/locale.conf', 'LANG=#{CONFIG[:locale]}.UTF-8')),
+]
+
+# Sets the keymap.
+executor.execute ['localectl', 'set-keymap', '--no-convert', CONFIG[:keymap]]
+
+# Adds users.
+CONFIG[:users].each do |user|
+  executor.execute ['useradd', '-m', user]
+end
+
+# Adds wheel users.
+CONFIG[:wheel_users].each do |user|
+  executor.execute ['useradd', '-m', '-G', 'wheel', user]
+end
+
+# Sets passwords.
+CONFIG[:passwords].each do |user, password|
+  executor.execute(
+    [
+      'ruby', '-e',
+      %(`echo #{
+        (user.to_s+':').shell_escaped}#{password.shell_escaped
+      } | chpasswd`)
+    ],
+    { quiet: true, extra_message: "Setting password for user #{user}.\n" },
+  )
+end
+
+# Configures sudo if set to.
+if CONFIG[:sudo_for_wheel] == true
+  executor.execute ['pacman', '-S', '--noconfirm', '--needed', 'sudo']
+  executor.execute [
+    'ruby', '-e',
+    %q(File.write('/etc/sudoers', "\n%wheel ALL=(ALL) ALL", mode: 'a')),
+  ]
+end
+
+# Bootloader setup.
+case CONFIG[:bootloader]
+# Systemd-boot.
+when'systemd-boot'
+  executor.execute ['bootctl', '--path=/boot', 'install']
+  executor.execute [
+    'ruby', '-e',
+    <<~EOD
+      install_name = 'arch' + Time.now.to_i.to_s
+
+      File.write(
+        '/boot/loader/loader.conf',
+        <<~EOD
+          default \#{install_name}
+          editor 1
+          timeout 3
+        \EOD
+      )
+      File.write(
+        "/boot/loader/entries/\#{install_name}.conf",
+        <<~EOD
+          title Arch Linux
+          linux /vmlinuz-#{CONFIG[:kernel]}
+          initrd /initramfs-#{CONFIG[:kernel]}.img
+          options root=#{Vars::PARTITIONS[:root]} rw
+        \EOD
+      )
+    EOD
+  ]
+# GRUB.
+when 'grub'
+  executor.execute [
+    'pacman', '-S', '--noconfirm', 'grub', 'efibootmgr', 'os-prober',
+  ]
+  executor.execute [
+    'grub-install', '--target=x86_64-efi', '--efi-directory=/boot',
+    "--bootloader-id=#{'arch'+Time.now.to_i.to_s}", '--recheck',
+  ]
+  executor.execute ['grub-mkconfig', '-o', '/boot/grub/grub.cfg']
+end
+
+# Installs packages.
+CONFIG[:packages].each do |package|
+  executor.execute ['pacman', '-S', '--noconfirm', package]
+end
+
+# Installs AUR packages if there is any.
+unless !CONFIG[:aur] || CONFIG[:aur].empty?
+  executor.execute [
+    'pacman', '-S', '--noconfirm', '--needed', 'base-devel', 'git', 'sudo',
+  ]
+
+  unless (
+    (CONFIG[:users]+CONFIG[:wheel_users]).include? CONFIG[:aur][:build_user]
+  )
+    executor.execute ['useradd', '-m', CONFIG[:aur][:build_user]]
+  end
+
+  executor.execute [
+    'ruby', '-e',
+    <<~EOD
+      File.write(
+        '/etc/sudoers',
+        "\\n#{CONFIG[:aur][:build_user]} ALL=(root) NOPASSWD: /usr/bin/pacman",
+        mode: 'a'
+      )
+    EOD
+  ]
+
+  CONFIG[:aur][:packages].each do |package|
+    executor.execute [
+      'git', 'clone', "https://aur.archlinux.org/#{package}",
+      "/opt/#{package}",
+    ]
+    executor.execute ['chown', CONFIG[:aur][:build_user], "/opt/#{package}"]
+    executor.execute [
+      'su', CONFIG[:aur][:build_user], '-s', '/bin/sh', '-c',
+      <<~EOD
+        cd /opt/#{package}
+        makepkg -sirc --noconfirm
+      EOD
+    ]
+  end
+end
+
+# Enabels daemons.
+CONFIG[:systemctl_enable].each do |daemon|
+  executor.execute ['systemctl', 'enable', daemon]
+end

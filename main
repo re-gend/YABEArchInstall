@@ -1,0 +1,106 @@
+#!/usr/bin/env ruby
+
+VERSION = '1.0.0'
+
+require 'optparse'
+require 'fileutils'
+require_relative 'internals/yabe'
+
+# Tries to clear previously stored variables if there is any.
+File.delete 'internals/vars.rb' if File.exist? 'internals/vars.rb'
+
+# Parse options into the hash.
+options = {}
+OptionParser.new do |opts|
+  opts.banner = <<~EOD
+    YABE Arch Install v#{VERSION}
+    
+    oprions:
+  EOD
+
+  opts.on('-V', '--version', 'Shows version and exit.') do
+    puts "YABEArchInstall v#{VERSION}"
+    exit
+  end
+  opts.on('-c', '--config FILE', 'Alternate path for config file.') do |file|
+    options[:config] = file
+  end
+  opts.on('--no-check', 'Does not check configuration.') do
+    options[:no_check] = true
+  end
+  opts.on('-s', '--step', 'Waits for <Enter> after every command.') do
+    options[:step] = true
+  end
+  opts.on('-f', '--force', 'Carries on installation even after an errror.') do
+    options[:force] = true
+  end
+end.parse!
+
+# Stores the options
+YABE.primitive_object_to_file('OPTIONS', options, 'internals/vars.rb')
+
+# Copies the config file so scripts can read it.
+FileUtils.cp(options[:config] || 'config.rb', 'internals/config.rb')
+
+# Loads the config file.
+require_relative 'internals/config'
+
+# Checks some configurations before installation unless disabled.
+unless options[:no_check]
+  require_relative 'internals/check_some_config'
+  errors = check_some_config
+
+  unless errors.empty?
+    error_message =
+      'The install did not start due to following issues in the config:'
+    errors.each do |error|
+      error_message += "\n\t" + error
+    end
+    YABE::raise_error(error_message, type: :interruption)
+  end
+end
+
+# Increases the cowspace for the installation if needed.
+if `df -h | grep cowspace`.split(' ')[1] =~ /.*(b|B|K|M)/
+  puts "Increasing cowspace for installation.\n".yabe_colored(:yabe)
+  system 'mount -o remount,size=1G /run/archiso/cowspace'
+end
+
+# Calculates the names of partitions and stores it.
+if CONFIG[:partitioning][:auto]
+  partitions = {}
+  p_in_partition_name = CONFIG[:partitioning][:disk] =~ /.*[0-9]/
+
+  [:boot, :root, :swap].each_with_index do |key, i|
+    partitions[key] = CONFIG[:partitioning][:disk] +
+      (p_in_partition_name ? 'p' : '') + (i+1).to_s
+  end
+else
+  partitions = {
+    boot: CONFIG[:partitioning][:boot],
+    root: CONFIG[:partitioning][:root],
+    swap: CONFIG[:partitioning][:swap],
+  }
+end
+YABE.primitive_object_to_file('PARTITIONS', partitions, 'internals/vars.rb')
+
+# Runs before_chroot.
+system 'internals/before_chroot'
+
+# Copies the appropriate files into /mnt.
+FileUtils.mkdir '/mnt/yabe'
+FileUtils.cp('internals/after_chroot', '/mnt/yabe/after_chroot')
+FileUtils.cp('internals/yabe.rb', '/mnt/yabe/yabe.rb')
+FileUtils.cp('internals/config.rb', '/mnt/yabe/config.rb')
+FileUtils.cp('internals/vars.rb', '/mnt/yabe/vars.rb')
+
+# arch-chroot to /mnt and run after_chroot.
+system 'arch-chroot /mnt yabe/after_chroot exit'
+
+# Removes the files in /mnt.
+FileUtils.remove_dir '/mnt/yabe'
+
+# Installation complete.
+puts 'Installation complete!'.yabe_colored(:yabe)
+puts 'You can arch-chroot into the /mnt directory for additional actions.'
+puts
