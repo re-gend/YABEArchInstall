@@ -36,6 +36,14 @@ executor.execute [
 # Sets the keymap.
 executor.execute ['localectl', 'set-keymap', '--no-convert', CONFIG[:keymap]]
 
+# Sets the hostname.
+executor.execute [
+  'ruby', '-e',
+  %(File.write('/etc/hostname', '#{
+    CONFIG[:hostname].gsub('\\') { |c| '\\'+c }.gsub("'") { |c| '\\'+c }
+  }'))
+]
+
 # Adds users.
 CONFIG[:users].each do |user|
   executor.execute ['useradd', '-m', user]
