@@ -57,8 +57,8 @@ There can be many ways to fetch the install script and installing, but simply
 cloning the git repository and running the script is one of the most simplest
 ways.
 
-Let us download the pacman database before installing packages.\
-`pacman -Sy`
+Let us download the pacman database and update before installing packages.\
+`pacman -Syu`
 
 Then, install git to be able to clone the repository.\
 `pacman -S git`
